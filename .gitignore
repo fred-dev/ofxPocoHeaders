@@ -1,0 +1,13 @@
+.DS_Store
+.vscode/
+__pycache__/
+
+# example build output
+example/obj/
+example/bin/*
+!example/bin/data/
+example/*.xcodeproj/
+example/*.xcconfig
+example/*.plist
+example/*.entitlements
+example/*.code-workspace

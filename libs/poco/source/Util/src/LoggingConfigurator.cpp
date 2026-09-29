@@ -1,0 +1,417 @@
+//
+// LoggingConfigurator.cpp
+//
+// Library: Util
+// Package: Configuration
+// Module:  LoggingConfigurator
+//
+// Copyright (c) 2004-2025, Applied Informatics Software Engineering GmbH.
+// and Contributors.
+//
+// SPDX-License-Identifier:	BSL-1.0
+//
+
+
+#include "Poco/Util/LoggingConfigurator.h"
+#include "Poco/Util/PropertyFileConfiguration.h"
+#include "Poco/AutoPtr.h"
+#include "Poco/Channel.h"
+#include "Poco/FormattingChannel.h"
+#include "Poco/Formatter.h"
+#include "Poco/PatternFormatter.h"
+#include "Poco/Logger.h"
+#include "Poco/LoggingRegistry.h"
+#include "Poco/LoggingFactory.h"
+#include "Poco/StringTokenizer.h"
+#include "Poco/String.h"
+#include "Poco/Format.h"
+#ifdef POCO_ENABLE_FASTLOGGER
+#include "Poco/FastLogger.h"
+#endif
+#include <map>
+#include <set>
+#include <sstream>
+
+
+using Poco::AutoPtr;
+using Poco::Formatter;
+using Poco::PatternFormatter;
+using Poco::Channel;
+using Poco::FormattingChannel;
+using Poco::Logger;
+using Poco::LoggingRegistry;
+using Poco::LoggingFactory;
+using namespace std::string_literals;
+
+
+namespace Poco {
+namespace Util {
+
+
+LoggingConfigurator::LoggingConfigurator() = default;
+
+
+LoggingConfigurator::~LoggingConfigurator() = default;
+
+
+Mutex LoggingConfigurator::_mutex;
+
+
+constexpr int MaxChannelNestingDepth = 64;
+
+
+void LoggingConfigurator::collectChannelNames(const std::string& name, AbstractConfiguration::Ptr pChConfig, std::set<std::string>& channelNames, int depth)
+{
+	if (name.empty() || channelNames.count(name)) return;
+	if (depth > MaxChannelNestingDepth)
+		throw Poco::InvalidArgumentException("Channel nesting too deep", name);
+	channelNames.insert(name);
+	std::string subChannels = pChConfig->getString(name + ".channels"s, ""s);
+	if (!subChannels.empty())
+	{
+		Poco::StringTokenizer tok(subChannels, ","s, Poco::StringTokenizer::TOK_TRIM);
+		for (const auto& sub : tok)
+			collectChannelNames(sub, pChConfig, channelNames, depth + 1);
+	}
+}
+
+
+void LoggingConfigurator::configure(AbstractConfiguration::Ptr pConfig)
+{
+	poco_check_ptr (pConfig);
+
+	Mutex::ScopedLock lock(_mutex);
+
+	AbstractConfiguration::Ptr pFormattersConfig(pConfig->createView("logging.formatters"s));
+	configureFormatters(pFormattersConfig);
+
+	AbstractConfiguration::Ptr pChannelsConfig(pConfig->createView("logging.channels"s));
+	configureChannels(pChannelsConfig);
+
+	AbstractConfiguration::Ptr pLoggersConfig(pConfig->createView("logging.loggers"s));
+	configureLoggers(pLoggersConfig);
+}
+
+
+void LoggingConfigurator::configure(AbstractConfiguration::Ptr pConfig, const std::string& loggerKey)
+{
+	poco_check_ptr(pConfig);
+
+	Mutex::ScopedLock lock(_mutex);
+
+	AbstractConfiguration::Ptr pLoggersConfig(pConfig->createView("logging.loggers"s));
+	if (!pLoggersConfig->hasProperty(loggerKey + ".name"s) && !pLoggersConfig->hasProperty(loggerKey + ".channel"s))
+	{
+		Logger::get("LoggingConfigurator"s).warning(
+			"No configuration found for logger key '%s' — "
+			"neither 'name' nor 'channel' property exists under logging.loggers.%s"s,
+			loggerKey, loggerKey);
+		return;
+	}
+
+	AutoPtr<AbstractConfiguration> pLoggerConfig(pLoggersConfig->createView(loggerKey));
+
+	// Collect channel names referenced by this logger's channel chain.
+	AbstractConfiguration::Ptr pChConfig(pConfig->createView("logging.channels"s));
+	std::set<std::string> channelNames;
+
+	std::string rootChannel = pLoggerConfig->getString("channel"s, ""s);
+	if (!pLoggerConfig->hasProperty("channel.class"s))
+		collectChannelNames(rootChannel, pChConfig, channelNames);
+
+	// Collect formatter names referenced by the collected channels.
+	std::set<std::string> formatterNames;
+	for (const auto& c : channelNames)
+	{
+		std::string fmt = pChConfig->getString(c + ".formatter"s, ""s);
+		if (!fmt.empty() && !pChConfig->hasProperty(c + ".formatter.class"s))
+			formatterNames.insert(fmt);
+	}
+
+	// Configure referenced formatters.
+	AbstractConfiguration::Ptr pFmtConfig(pConfig->createView("logging.formatters"s));
+	for (const auto& f : formatterNames)
+	{
+		if (pFmtConfig->hasProperty(f + ".class"s))
+		{
+			AutoPtr<AbstractConfiguration> pFormatterConfig(pFmtConfig->createView(f));
+			AutoPtr<Formatter> pFormatter(createFormatter(pFormatterConfig));
+			LoggingRegistry::defaultRegistry().registerFormatter(f, pFormatter);
+		}
+	}
+
+	// Configure referenced channels (two passes: create, then configure).
+	for (const auto& c : channelNames)
+	{
+		if (pChConfig->hasProperty(c + ".class"s))
+		{
+			AutoPtr<AbstractConfiguration> pChannelConfig(pChConfig->createView(c));
+			AutoPtr<Channel> pChannel = createChannel(pChannelConfig);
+			LoggingRegistry::defaultRegistry().registerChannel(c, pChannel);
+		}
+	}
+	for (const auto& c : channelNames)
+	{
+		if (pChConfig->hasProperty(c + ".class"s))
+		{
+			AutoPtr<AbstractConfiguration> pChannelConfig(pChConfig->createView(c));
+			Channel::Ptr pChannel = LoggingRegistry::defaultRegistry().channelForName(c);
+			configureChannel(pChannel, pChannelConfig);
+		}
+	}
+
+	// Configure the logger itself.
+	configureLogger(pLoggerConfig);
+}
+
+
+void LoggingConfigurator::configureFormatters(AbstractConfiguration::Ptr pConfig)
+{
+	for (const auto& key: pConfig->keys())
+	{
+		AutoPtr<AbstractConfiguration> pFormatterConfig(pConfig->createView(key));
+		AutoPtr<Formatter> pFormatter(createFormatter(pFormatterConfig));
+		LoggingRegistry::defaultRegistry().registerFormatter(key, pFormatter);
+	}
+}
+
+
+void LoggingConfigurator::configureChannels(AbstractConfiguration::Ptr pConfig)
+{
+    auto cKeys = pConfig->keys();
+	for (const auto& c: cKeys)
+	{
+		AutoPtr<AbstractConfiguration> pChannelConfig(pConfig->createView(c));
+		AutoPtr<Channel> pChannel = createChannel(pChannelConfig);
+		LoggingRegistry::defaultRegistry().registerChannel(c, pChannel);
+	}
+	for (const auto& c: cKeys)
+	{
+		AutoPtr<AbstractConfiguration> pChannelConfig(pConfig->createView(c));
+		Channel::Ptr pChannel = LoggingRegistry::defaultRegistry().channelForName(c);
+		configureChannel(pChannel, pChannelConfig);
+	}
+}
+
+
+void LoggingConfigurator::configureLoggers(AbstractConfiguration::Ptr pConfig)
+{
+	using LoggerMap = std::map<std::string, AutoPtr<AbstractConfiguration>>;
+
+	// use a map to sort loggers by their name, ensuring initialization in correct order (parents before children)
+	LoggerMap loggerMap;
+	for (const auto& l: pConfig->keys())
+	{
+		AutoPtr<AbstractConfiguration> pLoggerConfig(pConfig->createView(l));
+		loggerMap[pLoggerConfig->getString("name"s, ""s)] = pLoggerConfig;
+	}
+	for (const auto& p: loggerMap)
+	{
+		configureLogger(p.second);
+	}
+}
+
+
+Formatter::Ptr LoggingConfigurator::createFormatter(AbstractConfiguration::Ptr pConfig)
+{
+	Formatter::Ptr pFormatter(LoggingFactory::defaultFactory().createFormatter(pConfig->getString("class"s)));
+	for (const auto& p: pConfig->keys())
+	{
+		if (p != "class"s)
+			pFormatter->setProperty(p, pConfig->getString(p));
+	}
+	return pFormatter;
+}
+
+
+Channel::Ptr LoggingConfigurator::createChannel(AbstractConfiguration::Ptr pConfig)
+{
+	Channel::Ptr pChannel(LoggingFactory::defaultFactory().createChannel(pConfig->getString("class"s)));
+	Channel::Ptr pWrapper(pChannel);
+	for (const auto& p: pConfig->keys())
+	{
+		if (p == "pattern"s)
+		{
+			AutoPtr<Formatter> pPatternFormatter(new PatternFormatter(pConfig->getString(p)));
+			pWrapper = new FormattingChannel(pPatternFormatter, pChannel);
+		}
+		else if (p == "formatter"s)
+		{
+			AutoPtr<FormattingChannel> pFormattingChannel(new FormattingChannel(nullptr, pChannel));
+			if (pConfig->hasProperty("formatter.class"s))
+			{
+				AutoPtr<AbstractConfiguration> pFormatterConfig(pConfig->createView(p));
+				AutoPtr<Formatter> pFormatter(createFormatter(pFormatterConfig));
+				pFormattingChannel->setFormatter(pFormatter);
+			}
+			else pFormattingChannel->setProperty(p, pConfig->getString(p));
+			pWrapper = pFormattingChannel;
+		}
+	}
+	return pWrapper;
+}
+
+
+void LoggingConfigurator::configureChannel(Channel::Ptr pChannel, AbstractConfiguration::Ptr pConfig)
+{
+	for (const auto& p: pConfig->keys())
+	{
+		if (p != "pattern"s && p != "formatter"s && p != "class"s)
+		{
+			pChannel->setProperty(p, pConfig->getString(p));
+		}
+	}
+}
+
+
+void LoggingConfigurator::configureLogger(AbstractConfiguration::Ptr pConfig)
+{
+	const std::string loggerName = pConfig->getString("name"s, ""s);
+	const std::string loggerType = pConfig->getString("type"s, ""s);
+	const bool useFastLogger = icompare(loggerType, "fast"s) == 0;
+
+	auto props = pConfig->keys();
+
+	if (useFastLogger)
+	{
+#ifdef POCO_ENABLE_FASTLOGGER
+		// Process quill.* backend options BEFORE creating the logger,
+		// since FastLogger::get() starts the backend thread
+		for (const auto& p: props)
+		{
+			if (p == "quill"s)
+			{
+				AutoPtr<AbstractConfiguration> pQuillConfig(pConfig->createView(p));
+				for (const auto& q: pQuillConfig->keys())
+				{
+					FastLogger::setBackendOption(q, pQuillConfig->getString(q));
+				}
+			}
+		}
+
+		// Now create/get the logger (this starts the backend with the options set above)
+		FastLogger& logger = FastLogger::get(loggerName);
+		for (const auto& p: props)
+		{
+			if (p == "channel"s && pConfig->hasProperty("channel.class"s))
+			{
+				AutoPtr<AbstractConfiguration> pChannelConfig(pConfig->createView(p));
+				AutoPtr<Channel> pChannel(createChannel(pChannelConfig));
+				configureChannel(pChannel, pChannelConfig);
+				FastLogger::setChannel(logger.name(), pChannel);
+			}
+			else if (p != "name"s && p != "type"s && p != "quill"s)
+			{
+				FastLogger::setProperty(logger.name(), p, pConfig->getString(p));
+			}
+		}
+#else
+		throw Poco::InvalidAccessException("FastLogger is not available (POCO_ENABLE_FASTLOGGER is not defined)");
+#endif
+	}
+	else
+	{
+		Logger& logger = Logger::get(loggerName);
+		for (const auto& p: props)
+		{
+			if (p == "channel"s && pConfig->hasProperty("channel.class"s))
+			{
+				AutoPtr<AbstractConfiguration> pChannelConfig(pConfig->createView(p));
+				AutoPtr<Channel> pChannel(createChannel(pChannelConfig));
+				configureChannel(pChannel, pChannelConfig);
+				Logger::setChannel(logger.name(), pChannel);
+			}
+			else if (p == "quill"s)
+			{
+				// Warn about quill.* options on non-fast loggers
+				AutoPtr<AbstractConfiguration> pQuillConfig(pConfig->createView(p));
+				for (const auto& q: pQuillConfig->keys())
+				{
+					Logger::get("LoggingConfigurator"s).warning(
+						"Ignoring quill.%s property on logger '%s' - quill options only apply to type=fast loggers"s,
+						q, loggerName.empty() ? "(root)"s : loggerName);
+				}
+			}
+			else if (p != "name"s && p != "type"s)
+			{
+				Logger::setProperty(logger.name(), p, pConfig->getString(p));
+			}
+		}
+	}
+}
+
+
+void LoggingConfigurator::configure(
+	const std::string& level,
+	const std::string& pattern,
+	const std::string& configTemplate)
+{
+	std::string config = Poco::format(configTemplate, level, pattern);
+
+	std::istringstream istr(config);
+	AutoPtr<PropertyFileConfiguration> pConfig = new PropertyFileConfiguration(istr);
+
+	LoggingConfigurator configurator;
+	configurator.configure(pConfig);
+}
+
+
+Logger& LoggingConfigurator::getLogger(const std::string& name, AbstractConfiguration::Ptr pConfig)
+{
+	poco_check_ptr(pConfig);
+
+	Mutex::ScopedLock lock(_mutex);
+
+	if (auto pLogger = Logger::has(name))
+		return *pLogger;
+
+	if (validateConfiguration(pConfig))
+	{
+		configure(pConfig);
+	}
+	else
+	{
+		Logger::get("LoggingConfigurator"s).warning(
+			"Skipping configuration for logger '%s': "
+			"formatter or channel name collision with existing registry entry"s,
+			name);
+	}
+	return Logger::get(name);
+}
+
+
+bool LoggingConfigurator::validateConfiguration(AbstractConfiguration::Ptr pConfig) const
+{
+	LoggingRegistry& registry = LoggingRegistry::defaultRegistry();
+
+	AbstractConfiguration::Ptr pFmtConfig(pConfig->createView("logging.formatters"s));
+	auto fmtKeys = pFmtConfig->keys();
+	AbstractConfiguration::Ptr pChConfig(pConfig->createView("logging.channels"s));
+	auto chKeys = pChConfig->keys();
+
+	// No formatters or channels to validate — accept (logger-only config).
+	if (fmtKeys.empty() && chKeys.empty())
+		return true;
+
+	// Accept if at least one formatter or channel is new (not yet registered).
+	// This allows configs that reference some existing entries alongside new ones,
+	// which is the common case when a parent config has already registered shared
+	// entries. Only reject when ALL entries already exist (full collision).
+	for (const auto& f : fmtKeys)
+	{
+		if (!registry.hasFormatter(f))
+			return true;
+	}
+
+	for (const auto& c : chKeys)
+	{
+		if (!registry.hasChannel(c))
+			return true;
+	}
+
+	// All entries already exist — collision.
+	return false;
+}
+
+
+} } // namespace Poco::Util

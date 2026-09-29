@@ -1,0 +1,28 @@
+//
+// PartHandler.cpp
+//
+// Library: Net
+// Package: Messages
+// Module:  PartHandler
+//
+// Copyright (c) 2005-2006, Applied Informatics Software Engineering GmbH.
+// and Contributors.
+//
+// SPDX-License-Identifier:	BSL-1.0
+//
+
+
+#include "Poco/Net/PartHandler.h"
+
+
+namespace Poco {
+namespace Net {
+
+
+PartHandler::PartHandler() = default;
+
+
+PartHandler::~PartHandler() = default;
+
+
+} } // namespace Poco::Net

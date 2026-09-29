@@ -1,0 +1,237 @@
+//
+// ECDSADigestEngine.cpp
+//
+//
+// Library: Crypto
+// Package: ECDSA
+// Module:  ECDSADigestEngine
+//
+// Copyright (c) 2008, Applied Informatics Software Engineering GmbH.
+// and Contributors.
+//
+// SPDX-License-Identifier:	BSL-1.0
+//
+
+
+#include "Poco/Crypto/ECDSADigestEngine.h"
+#include "Poco/Crypto/CryptoException.h"
+#include <openssl/ecdsa.h>
+#include <openssl/evp.h>
+#include <openssl/bn.h>
+
+
+namespace Poco {
+namespace Crypto {
+
+
+//
+// ECDSADigestEngine
+//
+
+
+ECDSADigestEngine::ECDSADigestEngine(const ECKey& key, const std::string &name):
+	_key(key),
+	_engine(name)
+{
+}
+
+
+ECDSADigestEngine::~ECDSADigestEngine()
+{
+}
+
+
+std::size_t ECDSADigestEngine::digestLength() const
+{
+	return _engine.digestLength();
+}
+
+
+void ECDSADigestEngine::reset()
+{
+	_engine.reset();
+	_digest.clear();
+	_signature.clear();
+}
+
+
+const DigestEngine::Digest& ECDSADigestEngine::digest()
+{
+	if (_digest.empty())
+	{
+		_digest = _engine.digest();
+	}
+	return _digest;
+}
+
+
+const DigestEngine::Digest& ECDSADigestEngine::signature()
+{
+	if (_signature.empty())
+	{
+		digest();
+#if POCO_OPENSSL_VERSION_PREREQ(3, 0, 0)
+		EVP_PKEY_CTX* pCtx = EVP_PKEY_CTX_new(_key.impl()->getEVPPKey(), nullptr);
+		if (pCtx == nullptr)
+			throw OpenSSLException("ECDSADigestEngine::signature(): EVP_PKEY_CTX_new()");
+		if (EVP_PKEY_sign_init(pCtx) != 1)
+		{
+			EVP_PKEY_CTX_free(pCtx);
+			throw OpenSSLException("EVP_PKEY_sign_init()");
+		}
+		size_t sigLen = 0;
+		if (EVP_PKEY_sign(pCtx, nullptr, &sigLen, _digest.data(), _digest.size()) != 1)
+		{
+			EVP_PKEY_CTX_free(pCtx);
+			throw OpenSSLException("EVP_PKEY_sign()");
+		}
+		_signature.resize(sigLen);
+		if (EVP_PKEY_sign(pCtx, _signature.data(), &sigLen, _digest.data(), _digest.size()) != 1)
+		{
+			EVP_PKEY_CTX_free(pCtx);
+			throw OpenSSLException("EVP_PKEY_sign()");
+		}
+		_signature.resize(sigLen);
+		EVP_PKEY_CTX_free(pCtx);
+#else
+		_signature.resize(_key.size());
+		unsigned sigLen = static_cast<unsigned>(_signature.size());
+		if (!ECDSA_sign(0, &_digest[0], static_cast<unsigned>(_digest.size()),
+			&_signature[0], &sigLen, _key.impl()->getECKey()))
+		{
+			throw OpenSSLException();
+		}
+		if (sigLen < _signature.size()) _signature.resize(sigLen);
+#endif
+	}
+	return _signature;
+}
+
+
+bool ECDSADigestEngine::verify(const DigestEngine::Digest& sig)
+{
+	digest();
+#if POCO_OPENSSL_VERSION_PREREQ(3, 0, 0)
+	EVP_PKEY_CTX* pCtx = EVP_PKEY_CTX_new(_key.impl()->getEVPPKey(), nullptr);
+	if (pCtx == nullptr)
+		throw OpenSSLException("ECDSADigestEngine::verify(): EVP_PKEY_CTX_new()");
+	if (EVP_PKEY_verify_init(pCtx) != 1)
+	{
+		EVP_PKEY_CTX_free(pCtx);
+		throw OpenSSLException("EVP_PKEY_verify_init()");
+	}
+	int ret = EVP_PKEY_verify(pCtx, sig.data(), sig.size(), _digest.data(), _digest.size());
+	EVP_PKEY_CTX_free(pCtx);
+	if (ret == 1) return true;
+	if (ret == 0) return false;
+	throw OpenSSLException("ECDSADigestEngine::verify(): EVP_PKEY_verify()");
+#else
+	EC_KEY* pKey = _key.impl()->getECKey();
+	if (pKey)
+	{
+		int ret = ECDSA_verify(0, &_digest[0], static_cast<unsigned>(_digest.size()),
+			&sig[0], static_cast<unsigned>(sig.size()),
+			pKey);
+		if (1 == ret) return true;
+		else if (0 == ret) return false;
+	}
+	throw OpenSSLException();
+#endif
+}
+
+
+void ECDSADigestEngine::updateImpl(const void* data, std::size_t length)
+{
+	_engine.update(data, length);
+}
+
+
+//
+// ECDSASignature
+//
+
+
+ECDSASignature::ECDSASignature(const ByteVec& derSignature)
+{
+	poco_assert (!derSignature.empty());
+
+	const unsigned char* p = &derSignature[0];
+	_pSig = d2i_ECDSA_SIG(nullptr, &p, static_cast<long>(derSignature.size()));
+	if (!_pSig)
+		throw OpenSSLException();
+}
+
+
+ECDSASignature::ECDSASignature(const ByteVec& rawR, const ByteVec& rawS):
+	_pSig(ECDSA_SIG_new())
+{
+	poco_assert (!rawR.empty() && !rawS.empty());
+
+	if (!_pSig) throw CryptoException("cannot allocate ECDSA signature");
+
+	try
+	{
+		ECDSA_SIG_set0(_pSig,
+			BN_bin2bn(&rawR[0], static_cast<long>(rawR.size()), nullptr),
+			BN_bin2bn(&rawS[0], static_cast<long>(rawS.size()), nullptr));
+		const BIGNUM* pR = nullptr;
+		const BIGNUM* pS = nullptr;
+		ECDSA_SIG_get0(_pSig, &pR, &pS);
+		if (pR == nullptr || pS == nullptr)
+			throw Poco::Crypto::CryptoException("failed to decode R and S values");
+	}
+	catch (...)
+	{
+		ECDSA_SIG_free(_pSig);
+		throw;
+	}
+}
+
+
+ECDSASignature::~ECDSASignature()
+{
+	ECDSA_SIG_free(_pSig);
+}
+
+
+ECDSASignature::ByteVec ECDSASignature::toDER() const
+{
+	int size = i2d_ECDSA_SIG(_pSig, nullptr);
+	if (size > 0)
+	{
+		ByteVec buffer(size);
+		unsigned char* p = &buffer[0];
+		i2d_ECDSA_SIG(_pSig, &p);
+		return buffer;
+	}
+	else throw OpenSSLException();
+}
+
+
+ECDSASignature::ByteVec ECDSASignature::rawR() const
+{
+	ByteVec buffer;
+	const BIGNUM* pR = ECDSA_SIG_get0_r(_pSig);
+	if (pR)
+	{
+		buffer.resize(BN_num_bytes(pR));
+		BN_bn2bin(pR, &buffer[0]);
+	}
+	return buffer;
+}
+
+
+ECDSASignature::ByteVec ECDSASignature::rawS() const
+{
+	ByteVec buffer;
+	const BIGNUM* pS = ECDSA_SIG_get0_s(_pSig);
+	if (pS)
+	{
+		buffer.resize(BN_num_bytes(pS));
+		BN_bn2bin(pS, &buffer[0]);
+	}
+	return buffer;
+}
+
+
+} } // namespace Poco::Crypto
