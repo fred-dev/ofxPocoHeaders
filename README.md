@@ -45,6 +45,21 @@ libs/poco/src/...            generated one-line wrappers, the only files compile
 
 POCO's CMake build decides which files to compile per platform, and which sources are only ever `#include`d by others (for example `Mutex_POSIX.cpp`). `scripts/update_poco.py` applies the same rules and generates one small wrapper file per compilation unit, so any build system can compile the result without CMake. Build settings that POCO's CMake would pass as compiler flags live in the generated `Poco/ofxPocoConfig.h`, which `Poco/Config.h` includes. No `ADDON_DEFINES` are needed, and your code always sees the same settings POCO was compiled with.
 
+### Testing the addons that depend on it
+
+Two scripts check the addons that moved from `ofxPoco` to `ofxPocoHeaders`. Both find openFrameworks from their own location, or you can pass `--of`.
+
+```bash
+# Every addon cloned from fred-dev's fork, on its poco_headers_only branch, up to date
+scripts/check_addon_branches.sh          # add --fix to clone / switch / fast-forward where safe
+
+# Generate an Xcode project for one example per addon with the projectGenerator, build it for
+# this Mac's architecture, and optionally run each app for 20 seconds
+scripts/test_addons_xcode.sh --run 20    # also: --make, --arch, --config, --only ofxHTTP, --pg
+```
+
+Test projects and logs go to `apps/pocoHeadersTests_<timestamp>/`, and the addon repos are never modified.
+
 ### Updating POCO
 
 ```bash
