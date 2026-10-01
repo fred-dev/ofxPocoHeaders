@@ -11,3 +11,48 @@ example/*.xcconfig
 example/*.plist
 example/*.entitlements
 example/*.code-workspace
+
+# openFrameworks: commit src/, bin/data/ and addons.make only.
+# Regenerate IDE projects with projectGenerator.
+*.xcodeproj/
+*.xcworkspace/
+*.sln
+*.vcxproj
+*.vcxproj.filters
+*.vcxproj.user
+*.cbp
+xcuserdata/
+*/Makefile
+*/config.make
+*/Project.xcconfig
+*/openFrameworks-Info.plist
+*/of.entitlements
+*/icon.rc
+
+# Build output (bin/data is kept)
+*/bin/*
+!*/bin/data/
+obj/
+build/
+*.o
+*.app/
+*.exe
+*.pdb
+*.ilk
+*.exp
+
+# Python
+*.py[cod]
+.venv/
+venv/
+*-env/
+*.egg-info/
+.ipynb_checkpoints/
+.env
+
+# OS / editor
+._*
+Thumbs.db
+Desktop.ini
+*.swp
+.idea/
